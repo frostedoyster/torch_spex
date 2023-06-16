@@ -62,7 +62,7 @@ class SphericalExpansion(torch.nn.Module):
     >>> h2o = molecule("H2O")
     >>> spherical_expansion = SphericalExpansion(hypers, [1,8], device="cpu")
     >>> atomic_structures = ase_atoms_to_tensordict([h2o])
-    >>> spherical_expansion.forward(atomic_structures)
+    >>> spherical_expansion.forward(**atomic_structures)
     TensorMap with 2 blocks
     keys: a_i  lam  sigma
            1    0     1
@@ -83,9 +83,36 @@ class SphericalExpansion(torch.nn.Module):
         else:
             self.is_alchemical = False
 
-    def forward(self, structures: Dict[str, torch.Tensor]):
+    def forward(self,
+            positions: torch.Tensor,
+            atomic_species: torch.Tensor,
+            structure_indices: torch.Tensor,
+            pbcs: torch.Tensor,
+            cells: torch.Tensor,
+            n_structures: torch.Tensor
+        ) -> TensorMap:
+        """
+        We use `total_atoms` to describe the number of all atoms in all structures
+        in the description of the dimension of the paramaters.
 
-        expanded_vectors = self.vector_expansion_calculator(structures)
+        :param positions: [total_atoms, 3]
+                tensor with the xyz positions of all atoms in the structures
+        :param atomic_species: [total_atoms] tensor with the atomic species
+                for each atom
+        :param structure_indices: [total_atoms] tensor with the indices of the
+                corresponding structure for each atom
+        :param cells: [n_structures, 3, 3] tensor with the cell of the structure
+        :param pbcs: [n_structures, 3] tensor with the periodic boundary condiiions
+                in xyz direction
+        :param n_structures: [1] tensor with the number of structures
+
+        :returns expansion_coeffs:
+            the spherical expansion coefficients
+            :math:`c^{a_il}_{Ai, m, a_jn}`
+        """
+
+        expanded_vectors = self.vector_expansion_calculator(
+                positions, atomic_species, structure_indices, pbcs, cells, n_structures)
         samples_metadata = expanded_vectors.block(l=0).samples
 
         s_metadata = torch.LongTensor(samples_metadata["structure"].copy())  # Copy to suppress torch warning about non-writeability
@@ -222,10 +249,38 @@ class VectorExpansion(torch.nn.Module):
         self.spherical_harmonics_calculator = sphericart.torch.SphericalHarmonics(self.l_max, normalized=True)
         self.spherical_harmonics_split_list = [(2*l+1) for l in range(self.l_max+1)]
 
-    def forward(self, structures: Dict[str, torch.Tensor]):
+    def forward(self,
+            positions: torch.Tensor,
+            atomic_species: torch.Tensor,
+            structure_indices: torch.Tensor,
+            pbcs: torch.Tensor,
+            cells: torch.Tensor,
+            n_structures: torch.Tensor
+        ) -> TensorMap:
+        """
+        We use `total_atoms` to describe the number of all atoms in all structures
+        in the description of the dimension of the paramaters.
+
+        :param positions: [total_atoms, 3]
+                tensor with the xyz positions of all atoms in the structures
+        :param atomic_species: [total_atoms] tensor with the atomic species
+                for each atom
+        :param structure_indices: [total_atoms] tensor with the indices of the
+                corresponding structure for each atom
+        :param cells: [n_structures, 3, 3] tensor with the cell of the structure
+        :param pbcs: [n_structures, 3] tensor with the periodic boundary condiiions
+                in xyz direction
+        :param n_structures: [1] tensor with number of structures
+
+        :returns pair_expansion_coeffs:
+            the spherical expansion coefficients for each neighbour
+            :math:`c^{l}_{Aija_ia_j,m,n}`
+        """
 
         cutoff_radius = self.hypers["cutoff radius"]
-        cartesian_vectors = get_cartesian_vectors(structures, cutoff_radius)
+        cartesian_vectors = get_cartesian_vectors(
+                positions, atomic_species, structure_indices,
+                pbcs, cells, n_structures, cutoff_radius)
 
         bare_cartesian_vectors = cartesian_vectors.values.squeeze(dim=-1)
         r = torch.sqrt(
@@ -284,25 +339,33 @@ class VectorExpansion(torch.nn.Module):
         return vector_expansion_tmap
 
 
-def get_cartesian_vectors(structures: Dict[str, torch.Tensor], cutoff_radius: float):
+def get_cartesian_vectors(
+        positions: torch.Tensor,
+        atomic_species: torch.Tensor,
+        structure_indices: torch.Tensor,
+        pbcs: torch.Tensor,
+        cells: torch.Tensor,
+        n_structures: torch.Tensor,
+        cutoff_radius: float
+    ):
 
     labels = []
     vectors = []
 
-    for structure_index in range(structures["n_structures"]):
+    for structure_index in range(n_structures):
 
-        where_selected_structure = np.where(structures["structure_indices"] == structure_index)[0]
+        where_selected_structure = np.where(structure_indices == structure_index)[0]
 
         centers, neighbors, unit_cell_shift_vectors = get_neighbor_list(
-            structures["positions"].detach().cpu().numpy()[where_selected_structure], 
-            structures["pbcs"][structure_index], 
-            structures["cells"][structure_index], 
+            positions.detach().cpu().numpy()[where_selected_structure], 
+            pbcs[structure_index], 
+            cells[structure_index], 
             cutoff_radius) 
         
         atoms_idx = torch.LongTensor(where_selected_structure)
-        positions = structures["positions"][atoms_idx]
-        cell = torch.tensor(np.array(structures["cells"][structure_index]), dtype=torch.get_default_dtype())
-        species = structures["atomic_species"][atoms_idx]
+        positions = positions[atoms_idx]
+        cell = torch.tensor(np.array(cells[structure_index]), dtype=torch.get_default_dtype())
+        species = atomic_species[atoms_idx]
 
         structure_vectors = positions[neighbors] - positions[centers] + (unit_cell_shift_vectors @ cell).to(positions.device)  # Warning: it works but in a weird way when there is no cell
         vectors.append(structure_vectors)
