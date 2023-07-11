@@ -50,7 +50,7 @@ class SphericalExpansion(torch.nn.Module):
 
     >>> import numpy as np
     >>> from ase.build import molecule
-    >>> from torch_spex.structures import ase_atoms_to_tensordict
+    >>> from torch_spex.structures import structure_to_torch, build_neighborlist
     >>> from torch_spex.spherical_expansions import SphericalExpansion
     >>> hypers = {
     ...     "cutoff radius": 3,
@@ -61,8 +61,9 @@ class SphericalExpansion(torch.nn.Module):
     ... }
     >>> h2o = molecule("H2O")
     >>> spherical_expansion = SphericalExpansion(hypers, [1,8], device="cpu")
-    >>> atomic_structures = ase_atoms_to_tensordict([h2o])
-    >>> spherical_expansion.forward(**atomic_structures)
+    >>> position, species, cell, pbc = structure_to_torch(h2o)
+    >>> centers, pairs, cell_shifts = build_neighborlist(position, cell, pbc, hypers["cutoff radius"])
+    >>> spherical_expansion.forward(position, species, cell, cell_shifts, centers, pairs)
     TensorMap with 2 blocks
     keys: a_i  lam  sigma
            1    0     1
@@ -84,12 +85,13 @@ class SphericalExpansion(torch.nn.Module):
             self.is_alchemical = False
 
     def forward(self,
-            positions: torch.Tensor,
-            atomic_species: torch.Tensor,
-            structure_indices: torch.Tensor,
-            pbcs: torch.Tensor,
-            cells: torch.Tensor,
-            n_structures: torch.Tensor
+            positions: torch.Tensor, # [n_center, 3]
+            species: torch.Tensor, # [n_center]
+            cells: torch.Tensor, # [n_structure, 3, 3]
+            cells_shifts: torch.Tensor, # [n_pair, 3]
+            centers: torch.Tensor, # [n_center]
+            pairs: torch.Tensor, # [n_pair, 2]
+            structure_offsets : torch.Tensor = None # [n_structure]
         ) -> TensorMap:
         """
         We use `total_atoms` to describe the number of all atoms in all structures
@@ -112,7 +114,23 @@ class SphericalExpansion(torch.nn.Module):
         """
 
         expanded_vectors = self.vector_expansion_calculator(
-                positions, atomic_species, structure_indices, pbcs, cells, n_structures)
+                positions, species, cells, cells_shifts, centers, pairs, structure_offsets)
+
+        # PR comment copy paste as in VectorExpansion so test work for now
+        if structure_offsets is None:
+            if cells.shape != torch.Size([3,3]):
+                raise ValueError('When more than one structure is given the structure_offsets have to be given')
+            positions = positions.reshape(1, -1, 3)
+            species = species.reshape(-1) # PR COMMENt this I made very inconsistent, tmp hack, till offsets and so on are removed
+            cells = cells.reshape(1, 3, 3)
+            cells_shifts = cells_shifts.reshape(1, -1, 3)
+            structure_offsets = torch.zeros(1, dtype=pairs.dtype)
+            structure_indices_centers = torch.zeros(len(centers), dtype=pairs.dtype)
+            structure_indices_pairs = torch.zeros(len(pairs), dtype=pairs.dtype)
+            structure_unique_indices = torch.zeros(1, dtype=pairs.dtype)
+        else:
+            raise NotImplemented("Important for batchs. But probably I scratch structure offset, then everything simplifies.")
+
         samples_metadata = expanded_vectors.block(l=0).samples
 
         s_metadata = torch.LongTensor(samples_metadata["structure"].copy())  # Copy to suppress torch warning about non-writeability
@@ -121,11 +139,12 @@ class SphericalExpansion(torch.nn.Module):
         n_species = len(self.all_species)
         species_to_index = {atomic_number : i_species for i_species, atomic_number in enumerate(self.all_species)}
 
-        unique_s_i_indices = torch.stack((structures["structure_indices"], structures["center_number"]), dim=1)
-        s_i_metadata_to_unique = structures["structure_offsets"][s_metadata] + i_metadata
+        unique_s_i_indices = torch.stack((structure_indices_centers, centers), dim=1)
+
+        s_i_metadata_to_unique = structure_offsets[s_metadata] + i_metadata
 
         l_max = self.vector_expansion_calculator.l_max
-        n_centers = len(unique_s_i_indices)  # total number of atoms in this batch of structures
+        n_centers = len(centers)  # total number of atoms in this batch of structures
 
         densities = []
         if self.is_alchemical:
@@ -140,7 +159,7 @@ class SphericalExpansion(torch.nn.Module):
                 densities_l.index_add_(dim=0, index=density_indices.to(expanded_vectors_l.device), source=expanded_vectors_l)
                 densities_l = densities_l.reshape((n_centers, 2*l+1, -1))
                 densities.append(densities_l)
-            species = -np.arange(self.n_pseudo_species)
+            unique_species = -np.arange(self.n_pseudo_species)
         else:
             aj_metadata = samples_metadata["species_neighbor"]
             aj_shifts = np.array([species_to_index[aj_index] for aj_index in aj_metadata])
@@ -156,10 +175,10 @@ class SphericalExpansion(torch.nn.Module):
                 densities_l.index_add_(dim=0, index=density_indices.to(expanded_vectors_l.device), source=expanded_vectors_l)
                 densities_l = densities_l.reshape((n_centers, n_species, 2*l+1, -1)).swapaxes(1, 2).reshape((n_centers, 2*l+1, -1))  # need to swap n, a indices which are in the wrong order
                 densities.append(densities_l)
-            species = self.all_species
+            unique_species = self.all_species
 
         # constructs the TensorMap object
-        ai_new_indices = structures["atomic_species"]
+        ai_new_indices = species
         labels = []
         blocks = []
         for l in range(l_max+1):
@@ -183,8 +202,8 @@ class SphericalExpansion(torch.nn.Module):
                             names = ["a1", "n1", "l1"],
                             values = np.stack(
                                 [
-                                    np.repeat(species, vectors_l_block_n.shape[0]),
-                                    np.tile(vectors_l_block_n, species.shape[0]),
+                                    np.repeat(unique_species, vectors_l_block_n.shape[0]),
+                                    np.tile(vectors_l_block_n, unique_species.shape[0]),
                                     l*np.ones((densities_ai_l.shape[2],), dtype=np.int32)
                                 ],
                                 axis=1
@@ -249,21 +268,29 @@ class VectorExpansion(torch.nn.Module):
         self.spherical_harmonics_calculator = sphericart.torch.SphericalHarmonics(self.l_max, normalized=True)
         self.spherical_harmonics_split_list = [(2*l+1) for l in range(self.l_max+1)]
 
+    def forward_eqs(self,
+            positions: TensorMap, # metadata (structure center || species
+            neighbor_list: TensorMap, # empty TensorMap with metadata (structure, center, neighbor || cell_shift_x cell_shift_y, cell_shift_z)
+            cells: TensorMap, # metadata (structure || cell_x cell_y cell_z)
+        ) -> TensorMap:
+        raise NotImplemented("This is just for prototyping")
+
     def forward(self,
-            positions: torch.Tensor,
-            atomic_species: torch.Tensor,
-            structure_indices: torch.Tensor,
-            pbcs: torch.Tensor,
-            cells: torch.Tensor,
-            n_structures: torch.Tensor
+            positions: torch.Tensor, # [n_center, 3]
+            species: torch.Tensor, # [n_center]
+            cells: torch.Tensor, # [n_structure, 3, 3]
+            cells_shifts: torch.Tensor, # [n_pair, 3]
+            centers: torch.Tensor, # [n_center]
+            pairs: torch.Tensor, # [n_pair, 2]
+            structure_offsets : torch.Tensor = None # [n_structure]
         ) -> TensorMap:
         """
         We use `total_atoms` to describe the number of all atoms in all structures
         in the description of the dimension of the paramaters.
 
-        :param positions: [total_atoms, 3]
+        :param positions: [n_atoms, 3]
                 tensor with the xyz positions of all atoms in the structures
-        :param atomic_species: [total_atoms] tensor with the atomic species
+        :param  species: [total_atoms] tensor with the atomic species
                 for each atom
         :param structure_indices: [total_atoms] tensor with the indices of the
                 corresponding structure for each atom
@@ -276,11 +303,21 @@ class VectorExpansion(torch.nn.Module):
             the spherical expansion coefficients for each neighbour
             :math:`c^{l}_{Aija_ia_j,m,n}`
         """
+        if structure_offsets is None:
+            if cells.shape != torch.Size([3,3]):
+                raise ValueError('When more than one structure is given the structure_offsets have to be given')
+            positions = positions.reshape(1, -1, 3)
+            species = species.reshape(1, -1)
+            cells = cells.reshape(1, 3, 3)
+            cells_shifts = cells_shifts.reshape(1, -1, 3)
+            structure_offsets = torch.zeros(1, dtype=pairs.dtype)
+            structure_indices_centers = torch.zeros(len(centers), dtype=pairs.dtype)
+            structure_indices_pairs = torch.zeros(len(pairs), dtype=pairs.dtype)
+            structure_unique_indices = torch.zeros(1, dtype=pairs.dtype)
+        else:
+            raise NotImplemented("Important for batchs. But probably I scratch structure offset, then everything simplifies.")
 
-        cutoff_radius = self.hypers["cutoff radius"]
-        cartesian_vectors = get_cartesian_vectors(
-                positions, atomic_species, structure_indices,
-                pbcs, cells, n_structures, cutoff_radius)
+        cartesian_vectors = get_cartesian_vectors(positions, species, cells, pairs, cells_shifts, structure_indices_pairs, structure_unique_indices)
 
         bare_cartesian_vectors = cartesian_vectors.values.squeeze(dim=-1)
         r = torch.sqrt(
@@ -338,52 +375,39 @@ class VectorExpansion(torch.nn.Module):
 
         return vector_expansion_tmap
 
-
-def get_cartesian_vectors(
-        positions: torch.Tensor,
-        atomic_species: torch.Tensor,
-        structure_indices: torch.Tensor,
-        pbcs: torch.Tensor,
-        cells: torch.Tensor,
-        n_structures: torch.Tensor,
-        cutoff_radius: float
-    ):
+def get_cartesian_vectors(positions, species, cells, pairs, cells_shifts, structure_indices, structure_unique_indices):
 
     labels = []
     vectors = []
+    torch.unique(structure_indices)
+    for structure_index in structure_unique_indices:
+        where_selected_structure = torch.where(structure_indices == structure_index)[0]
 
-    for structure_index in range(n_structures):
+        centers = pairs[:, 0]
+        neighbors = pairs[:, 1]
 
-        where_selected_structure = np.where(structure_indices == structure_index)[0]
-
-        centers, neighbors, unit_cell_shift_vectors = get_neighbor_list(
-            positions.detach().cpu().numpy()[where_selected_structure], 
-            pbcs[structure_index], 
-            cells[structure_index], 
-            cutoff_radius) 
-        
-        atoms_idx = torch.LongTensor(where_selected_structure)
-        positions = positions[atoms_idx]
-        cell = torch.tensor(np.array(cells[structure_index]), dtype=torch.get_default_dtype())
-        species = atomic_species[atoms_idx]
-
-        structure_vectors = positions[neighbors] - positions[centers] + (unit_cell_shift_vectors @ cell).to(positions.device)  # Warning: it works but in a weird way when there is no cell
+        atoms_idx = where_selected_structure
+        positions_i = positions[structure_index]
+        cell = cells[structure_index]
+        cell_shifts = torch.tensor(cells_shifts[structure_index], dtype=cells.dtype)
+        species = species[structure_index]
+        structure_vectors = positions_i[neighbors] - positions_i[centers] + (cell_shifts @ cell)
         vectors.append(structure_vectors)
         labels.append(
-            np.stack([
-                np.array([structure_index]*len(centers)), 
-                centers.numpy(), 
-                neighbors.numpy(), 
-                species[centers], 
+            torch.stack([
+                torch.tensor([structure_index]*len(centers), dtype=centers.dtype),
+                centers,
+                neighbors,
+                species[centers],
                 species[neighbors],
-                unit_cell_shift_vectors[:, 0],
-                unit_cell_shift_vectors[:, 1],
-                unit_cell_shift_vectors[:, 2]
-            ], axis=-1))
+                cell_shifts[:, 0],
+                cell_shifts[:, 1],
+                cell_shifts[:, 2]
+            ], dim=-1).detach().numpy())
 
     vectors = torch.cat(vectors, dim=0)
     labels = np.concatenate(labels, axis=0)
-    
+
     block = TensorBlock(
         values = vectors.unsqueeze(dim=-1),
         samples = Labels(
@@ -399,30 +423,4 @@ def get_cartesian_vectors(
         properties = Labels.single()
     )
 
-    return block 
-
-
-def get_neighbor_list(positions, pbc, cell, cutoff_radius):
-
-    centers, neighbors, unit_cell_shift_vectors = ase.neighborlist.primitive_neighbor_list(
-        quantities="ijS",
-        pbc=pbc,
-        cell=cell,
-        positions=positions,
-        cutoff=cutoff_radius,
-        self_interaction=True,
-        use_scaled_positions=False,
-    )
-
-    pairs_to_throw = np.logical_and(centers == neighbors, np.all(unit_cell_shift_vectors == 0, axis=1))
-    pairs_to_keep = np.logical_not(pairs_to_throw)
-
-    centers = centers[pairs_to_keep]
-    neighbors = neighbors[pairs_to_keep]
-    unit_cell_shift_vectors = unit_cell_shift_vectors[pairs_to_keep]
-
-    centers = torch.LongTensor(centers)
-    neighbors = torch.LongTensor(neighbors)
-    unit_cell_shift_vectors = torch.tensor(unit_cell_shift_vectors, dtype=torch.get_default_dtype())
-
-    return centers, neighbors, unit_cell_shift_vectors
+    return block
